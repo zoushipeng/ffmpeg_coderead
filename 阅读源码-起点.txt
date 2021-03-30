@@ -1,0 +1,197 @@
+2021-03-22
+
+ffmpeg版本 4.2.2
+
+尝试从最简单的解码流程，从一个本地文件中读取每一帧。
+
+需要经历的各个必须函数开始阅读。
+
+1、av_register_all
+
+该函数在较老版本的ffmpeg程序中几乎属于第一个被调用的，源码备注
+“* Initialize libavformat and register all the muxers, demuxers and
+ * protocols. If you do not call this function, then you can select
+ * exactly which formats you want to support.”
+ 
+ 翻译
+ “ 初始化libavformat库，注册所有的复用器，解复用器以及协议。如果你不调用这个方法，
+ 你可以手动选择你要支持的特定的格式”
+ 
+ 该函数已被标识为弃用。包括av_register_input_format，av_register_output_format均已弃用。
+ 此三个函数实际实现一样，为
+ ff_thread_once(&av_format_next_init, av_format_init_next);
+ 
+ ff_thread_once在ffmpeg源码中会出现很多次，其作用为全局只对参数2标识的函数执行一次，通过对参数1的控制来实现。
+ 此函数为内联函数。参数1一般为静态参数吗，定义为AVOnce， 实际是char参数。
+ 参数2函数定义需要为 (void) func(void);
+ 
+ 在具有pthread特性编译中，ff_thread_once实际调用pthread_once实现，包括后续mutex相关的加锁、释放等函数。
+ 
+ 因此，注册函数实际调用为 av_format_init_next
+ 
+ 在此函数中，首先进行加锁操作，其次，依次对muxer_list， outdev_list，demuxer_list，indev_list进行遍历。然后释放锁。
+ 
+ 这几个数组的定义，如muxer_list，是由configure文件在配置时,由print_enabled_components根据muxer_list.c文件生成，
+ 而muxer_list.c又是由configure中的find_things_extern函数从allformat.c文件中根据extern定义实现。其他几个也是类似。
+ 所以，ffmpeg支持的列表都定义在allformat.c文件中。
+ 
+ 所以，可以看到，此函数实际上为空操作，并未实现什么具体功能。
+
+2021-03-23
+ 
+2、avformat_open_input
+函数定义如下：int avformat_open_input(AVFormatContext **ps, const char *url, ff_const59 AVInputFormat *fmt, AVDictionary **options);
+函数描述为：
+/**
+ * Open an input stream and read the header. The codecs are not opened.
+ * The stream must be closed with avformat_close_input().
+ *
+ * @param ps Pointer to user-supplied AVFormatContext (allocated by avformat_alloc_context).
+ *           May be a pointer to NULL, in which case an AVFormatContext is allocated by this
+ *           function and written into ps.
+ *           Note that a user-supplied AVFormatContext will be freed on failure.
+ * @param url URL of the stream to open.
+ * @param fmt If non-NULL, this parameter forces a specific input format.
+ *            Otherwise the format is autodetected.
+ * @param options  A dictionary filled with AVFormatContext and demuxer-private options.
+ *                 On return this parameter will be destroyed and replaced with a dict containing
+ *                 options that were not found. May be NULL.
+ *
+ * @return 0 on success, a negative AVERROR on failure.
+ *
+ * @note If you want to use custom IO, preallocate the format context and set its pb field.
+ */
+ 
+翻译如下：
+/**
+ * 打开一个输入流，读取头信息，编码器未打开。
+ * 这个流必须调用avformat_close_input()关闭。
+ *
+ * @param ps 调用方提供的AVFormatContext指针，由avformat_alloc_context分配内存。
+ *           可以是空指针，函数内部将会分配内存，并写入ps所指向的内容。
+ *           注意，用户提供的AVFormatContext指针，在该函数失败时被释放。
+ * @param url 需要打开的流的URL
+ * @param fmt 如果不为空，则强制指定为一个输入格式，否则，将会自动检测。
+ * @param options  一个由AVFormatContext和私有解码器组成的字典结构。返回时，该参数可能会被销毁或替换为
+ *                 一个包含未找到项的字典。可能为空
+ * @return 成功返回0， 失败返回AVERROR类型的负数
+ *
+ * @note 注意，如果你想使用自定义IO，预先分配AVFormatContext指针内存，并设置pb参数。
+ */
+ 
+ 从描述中看，该函数主要用来侦测输入流的一些格式。因此，我们通常第一步使用该函数，以获取输入流的信息。
+
+2021-03-29
+ 
+ 具体分析开始：
+ 首先，检查传入的AVFormatContext指针，如果为空，则使用avformat_alloc_context函数，分配内存空间。
+ avformat_alloc_context函数：
+	a) 申请AVFormatContext大小的内存空间。
+	b) 为AVFormatContext参数赋默认值
+	c) 为AVFormatContext参数internal分配内存，该参数为AVFormatInternal类型指针
+	d) 为internal参数内部数据赋值，offset = (AV_NOPTS_VALUE = 0x8000000000000000)，raw_packet_buffer_remaining_size = 2500000， shortest_end = 0x8000000000000000
+ 
+ 然后，检查AVFormatContext的av_class是否赋值，如果未赋值，则表示不是通过avformat_alloc_context函数生成，属于异常参数。
+ 再将传入的fmt参数和options参数赋值到AVFormatContext中。
+ 如果AVIOContext类型参数pb有值，则需要将AVFMT_FLAG_CUSTOM_IO添加到AVFormatContext中的flags参数，该参数用于控制复用器/解复用器的行为。
+ 将输入的url参数赋值给AVFormatContext的url和filepath参数。
+ 然后，将会调用init_input函数，对输入流做一些处理，并对AVFormatContext指针赋值。
+ /**
+  * 函数注释
+  *  Open input file and probe the format if 
+  *  打开输入文件，必要时检查格式打开输入文件，必要时检查格式
+ **/
+ init_input函数：
+	a) 根据输入url，生成一个AVProbeData类型参数。
+	b) 赋值score类型为25分，此值为AVPROBE_SCORE_RETRY，意思为重试分数。最大分数为100.
+	c) 如果AVFormatContext的参数pb有值，则对此进行处理。
+		a) 如果AVFormatContext的参数iformat为空，则调用av_probe_input_buffer2函数进行处理。
+		b) 其他情况直接返回0.
+	d) 如果iformat参数存在，且其标志包含AVFMT_NOFILE，则返回25
+	e) 调用函数av_probe_input_format2，并赋值给iformat参数，返回计算后的分数。
+	f) 尝试调用AVFormatContext的io_open参数，如果出错，则返回该函数返回的值。io_open函数，默认实现为io_open_default函数。通过此函数初始化AVIOContext。
+	g) 如果iformat有值，返回0， 否则，调用av_probe_input_buffer2对pb参数处理，并返回结果。
+
+ 我们按照正常流程来说，iformat参数一开始是没有的，需要调用io_open打开输入流，并检测输入格式。	
+ io_open_default函数，此函数除了打印日志外，实际调用ffio_open_whitelist函数。
+ ffio_open_whitelist函数，此函数依次调用ffurl_open_whitelist函数和ffio_fdopen函数。
+ 
+ ffurl_open_whitelist函数：
+	a) 调用ffurl_alloc，查找输入的格式
+		a) 通过url_find_protocol对输入的流名称解析为对应的协议。
+			a) 通过解析输入字符串的协议头，判断是file文件或者其他协议。协议总表见avformat/protocol.c头部，extern定义的URLProtocol类型
+		b) 如果找到了，调用url_alloc_for_protocol函数，进行分内存分配。
+	b) 将传入的参数进行必要的赋值操作
+	c) 调用ffurl_connect函数，对协议进行连接。
+		a) 首先判断传入的协议在白名单中，且不在黑名单。
+		b) 然后，检测URLContext类型输入的url，其URLProtocol类型参数prot的url_open2函数是否存在，如存在，则使用url_open2打开，否则，使用url_open打开。
+
+2021-03-30
+
+ 此处，我们先分析file类型URLProtocol的url_open2及url_open函数。
+ URLProtocol ff_file_protocol;
+ ff_file_protocol定义在file.文件中，前提是定义了CONFIG_FILE_PROTOCOL。即配置文件类型协议。
+ 此协议，url_open2未定义，url_open定义为file_open函数。
+
+ file_open函数：此函数实际调用了open函数，打开文件，并设置一些额外参数，以便外部能统一读取。对于网络类文件，max_packet_size优化为262144 = 256K
+
+ ffio_fdopen函数：
+	a) 获取URLContext的max_packet_size。如果其为0，则设置buff_size为IO_BUFFER_SIZE（32768 = 0x8000 = 32K）。并分配内存。
+	b) 调用avio_alloc_context函数对AVIOContext类型类型参数进行内存分配和内部参数赋值。
+	c) 通过URLContext参数，将一些参数赋值给AVIOContext，以便外部统一使用AVIOContext。
+	   例如，URLContext的proctol存在，则将协议的url_read_pause，url_read_seek函数赋值给AVIOContext的read_pause，read_seek参数。
+ 
+ av_probe_input_buffer2函数：
+	a) 检查是否传入检测格式输入读取的最大值max_probe_size，如果为0，则设置最大值为 1<<20；如果小于2048，则返回出错。
+	b) 如果读取的偏移值大于max_probe_size，则返回出错。
+	c) 如果输入的AVIOContext的av_class参数不为空，则表示已被初始化。获取其mime_type属性，赋值给semi参数。
+	d) 尝试读取数据，直到成功解析格式为止，或超过最大读取大小。
+		a) 设置读取大小为上次读取的2倍，初始值为2048.如果此大小大于max_probe_size，返回0；
+		b) 使用avio_read函数通过AVIOContext读取数据，调用av_probe_input_format2函数解析格式解析。成功后跳出循环。
+ 
+ av_probe_input_format2函数：
+	a) 调用函数av_probe_input_format3，返回分数。
+	b) 如果分数大于传入的分数（默认是AVPROBE_SCORE_RETRY = 25），则返回检测出的格式及分数。
+
+av_probe_input_format2函数：
+	a) 检测传入数据，如果没有，则使用32字节的zerobuffer赋值。
+	b) 首先检测是否是ID3V2（即mp3格式）。如果是，则根据协议，重新赋值buf和bufsize等参数，以便后续统一处理。
+	c) 使用av_demuxer_iterate遍历demuxer（解复用器），对每一个AVInputFormat格式进行以下处理
+		a) 对于需要使用avio_open的解复用器（即flag & 0x0001 = 1）或者是image2名称的解复用器，跳过。
+		b) 如果该协议定义了read_probe函数，则使用该函数进行处理。
+		c) 如果该格式定义了extensions（如.mp4），则检测输入的文件名称匹配上extensions。匹配上，则分数为50；
+		d) 如果mine_type匹配上，则分数为75；
+		e) 如果分数大于传入的分数（一般为25），则返回成功。
+
+我们尝试解析一下MP4格式的read_probe函数。正常来说，MP4格式的文件，最终都是使用AVInputFormat ff_mov_demuxer来解封装。
+其定义在mov.c文件中，read_probe函数为mov_probe。
+
+mov_probe函数：
+	a) 从0开始，对传入的数据进行处理offset = 0，如果offset+8大于输入数据大小，则跳出循环
+	b) 从offset+4处取4字节判断，如果是“moov”，如果是，则将moov_offset设为offset+4。并与C步骤一同处理。
+	c) 如果是“mdat”，“pnot”，“udta”，“ftyp”，则进行如下处理：
+		a) 如果前4个字节组成的int数字小于8，且符合以下任意一个条件（该数字不为1，offset+12 > 出入数据的大小，后一轮数据均为0）,
+		   则分数为50分。
+		b) 如果是“ftyp”，并且下一轮数据前4字节为“jp2 ”或“jpx ”,则分数为5分；
+		c) 其他情况下，分数为100分。
+		d) offset加上max(4， offset处前4字节组成的int值)
+	d) 如果是“ediw”，“wide”，“free”，“junk”，“pick”，则分数为95分，offset加上max(4， offset处前4字节组成的int值)
+	e) 
+
+
+该协议解析原理参照：
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
