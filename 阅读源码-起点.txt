@@ -176,14 +176,23 @@ mov_probe函数：
 		c) 其他情况下，分数为100分。
 		d) offset加上max(4， offset处前4字节组成的int值)
 	d) 如果是“ediw”，“wide”，“free”，“junk”，“pick”，则分数为95分，offset加上max(4， offset处前4字节组成的int值)
-	e) 
+	e) 如果是“0x82,0x82,0x7f,0x7d”， “skip”，“uuid”, “prfl”,则分数为50分，offset加上max(4， offset处前4字节组成的int值)
+	f) 其他情况，直接offset加上max(4， offset处前4字节组成的int值)。
+	g) 当所有数据处理完后，单独处理moov特殊数据。然后返回分数。
 
 
-该协议解析原理参照：
- 
- 
- 
- 
+该协议解析原理参照：MP4协议解析。实际此处按照每个MP4内容分为的box来进行解析。可参照https://blog.csdn.net/mengzhengjie/article/details/103275364
+
+2021-03-31
+
+截至目前为止，我们已经分析了init_input函数的完整流程，已经打开了输入文件，并从中读取了一些数据，获取到了输入文件的格式。
+接下来，继续分析avformat_open_input。
+初始化输入完成后，检查格式是否不在白名单内或者在黑名单内。
+然后，通过avio_skip将AVIOContext回退到初始位置（在检测格式时，已经读取了部分数据，此时读取指针不在初始时）。该函数实际调用avio_seek。
+如果有priv_data，则分配内存并进行赋值操作。
+如果AVIOContext类型的pb参数存在，则调用ff_id3v2_read_dict函数进行处理。（AVFMT_NOFILE类型的格式，pb参数为空）
+
+
  
  
  
